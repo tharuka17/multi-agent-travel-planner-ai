@@ -62,6 +62,24 @@ curl -X POST http://localhost:8000/chat \
 - "find flights from New York to London"
 - "show all flights"
 
+## Gradio Chat UI
+
+A simple Gradio chat interface is available in `gradio_app.py`.
+
+Run the FastAPI backend first:
+
+```bash
+python main.py
+```
+
+Then start the Gradio UI:
+
+```bash
+python gradio_app.py
+```
+
+Open the local Gradio URL shown in the terminal and ask for flights or hotels.
+
 ## Tech Stack
 
 - **FastAPI** - Web framework
