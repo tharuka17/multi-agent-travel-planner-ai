@@ -60,6 +60,26 @@ sub_action = search
 city = YYY
 check_in = 2026-06-01
 check_out = 2026-06-05
+
+User: "book hotel H123 for John Doe from 2026-06-01 to 2026-06-05"
+intent = hotel
+sub_action = book
+hotel_id = H123
+guest_name = John Doe
+guest_email = john.doe@example.com
+room_type = null
+check_in = 2026-06-01
+check_out = 2026-06-05
+
+User: "book flight F456 for Jane Smith with email jane.smith@example.com"
+intent = flight
+sub_action = book
+flight_id = F456
+passenger_name = Jane Smith
+passenger_email = jane.smith@example.com
+origin = null
+destination = null
+flight_date = null
 """
 
 
