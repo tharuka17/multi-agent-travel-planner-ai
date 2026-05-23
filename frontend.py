@@ -1,8 +1,6 @@
 import json
 import os
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
 import gradio as gr
 
 API_URL = os.environ.get("TRAVEL_PLANNER_API_URL", "http://127.0.0.1:8000/chat")
@@ -11,10 +9,21 @@ API_URL = os.environ.get("TRAVEL_PLANNER_API_URL", "http://127.0.0.1:8000/chat")
 def format_flights(flights):
     lines = ["Flights:"]
     for flight in flights:
+        id = flight.get("_id", "Unknown ID")
+        airline = flight.get("airline", "Unknown Airline")
+        flight_number = flight.get("flightNumber", "Unknown Flight Number")
+        origin = flight.get("origin", {}).get("airport", "Unknown Origin")
+        destination = flight.get("destination", {}).get("airport", "Unknown Destination")
+        flight_date = flight.get("flightDate", "Unknown Date")
+        departure_time = flight.get("departureTime", "Unknown Departure Time")
+        arrival_time = flight.get("arrivalTime", "Unknown Arrival Time")
+        price = flight.get("price", "Unknown Price")
+        currency = flight.get("currency", "Unknown Currency")
+        available_seats = flight.get("availableSeats", "Unknown Available Seats")
         lines.append(
-            f"{flight.get('airline')} {flight.get('flightNumber')} from {flight['origin']['airport']} to {flight['destination']['airport']} "
-            f"on {flight.get('flightDate')} {flight.get('departureTime')} - {flight.get('arrivalTime')} "
-            f"- {flight.get('currency')} {flight.get('price')} - {flight.get('availableSeats')} seats"
+            f"{id}: {airline} {flight_number} from {origin} to {destination} "
+            f"on {flight_date} {departure_time} - {arrival_time} "
+            f"- {currency} {price} - {available_seats} seats"
         )
     return "\n".join(lines)
 
@@ -22,10 +31,12 @@ def format_flights(flights):
 def format_hotels(hotels):
     lines = ["Hotels:"]
     for hotel in hotels:
+        id = hotel.get("_id", "Unknown ID")
         name = hotel.get("name") or "Unknown Hotel"
         city = hotel.get("city") or hotel.get("location", {}).get("city", "")
-        price = hotel.get("price") or hotel.get("currency", "")
-        lines.append(f"{name} in {city} - {price}")
+        price_per_night = hotel.get("pricePerNight") or "Price not available"
+        currency = hotel.get("price") or hotel.get("currency", "")
+        lines.append(f"{id}: {name} in {city} - {price_per_night}{currency} per night")
     return "\n".join(lines)
 
 
@@ -36,10 +47,6 @@ def call_chat_api(message):
     try:
         response = urlopen(request, timeout=15)
         data = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        return f"Backend error {exc.code}: {exc.reason}"
-    except URLError as exc:
-        return f"Unable to reach backend at {API_URL}: {exc.reason}"
     except Exception as exc:
         return f"Unexpected error: {exc}"
 
