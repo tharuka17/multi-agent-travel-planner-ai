@@ -1,5 +1,6 @@
 from datetime import date
 
+
 SYSTEM_PROMPT=f"""
 You are a travel booking information extractor.
 
@@ -97,3 +98,24 @@ If the user asks something outside hotel/flight search, politely guide them back
 If the user message is incomplete, ask for the missing details.
 Keep the answer short and conversational.
 """
+
+
+def get_system_prompt_with_history(conversation_history: str) -> str:
+    system_prompt = SYSTEM_PROMPT
+    if conversation_history:
+        system_prompt += f"""
+
+CONVERSATION HISTORY:
+{conversation_history}
+"""
+    return system_prompt
+
+def get_system_prompt_for_unknown_node(conversation_history: str) -> str:
+    system_prompt = SYSTEM_PROMPT_FOR_UNKNOWN_NODE
+    if conversation_history:
+        system_prompt += f"""
+
+CONVERSATION HISTORY:
+{conversation_history}
+"""
+    return system_prompt

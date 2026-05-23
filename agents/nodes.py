@@ -1,11 +1,11 @@
 from typing import Optional, Literal
 
 from pydantic import BaseModel, Field
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from .tools import get_hotels, search_hotel, book_hotel, get_flights, search_flights, book_flight
 from .llm import llm
-from .prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_FOR_UNKNOWN_NODE
+from .prompts import get_system_prompt_for_unknown_node, get_system_prompt_with_history
 from .entity import GraphState
 
 
@@ -88,16 +88,22 @@ class TravelExtraction(BaseModel):
 
 travel_extractor = llm.with_structured_output(TravelExtraction)
 
+
 def router(state: GraphState) -> dict:
     user_message = state["messages"][-1]
+    history_messages = state["messages"][:-1]
+    
+    system_prompt = get_system_prompt_with_history("\n".join(history_messages))
+
+    invocation_messages = [SystemMessage(content=system_prompt)]
+    for i in range(0, len(history_messages), 2):
+        invocation_messages.append(HumanMessage(content=history_messages[i]))
+        if i + 1 < len(history_messages):
+            invocation_messages.append(AIMessage(content=history_messages[i + 1]))
+    invocation_messages.append(HumanMessage(content=user_message))
 
     try:
-        extracted = travel_extractor.invoke(
-            [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=user_message),
-            ]
-        )
+        extracted = travel_extractor.invoke(invocation_messages)
 
         data = extracted.dict()
 
@@ -431,14 +437,19 @@ def flight_node(state: GraphState) -> dict:
 
 def unknown_node(state: GraphState) -> dict:
     user_message = state["messages"][-1]
+    history_messages = state["messages"][:-1]
+
+    system_prompt = get_system_prompt_for_unknown_node("\n".join(history_messages))
+
+    invocation_messages = [SystemMessage(content=system_prompt)]
+    for i in range(0, len(history_messages), 2):
+        invocation_messages.append(HumanMessage(content=history_messages[i]))
+        if i + 1 < len(history_messages):
+            invocation_messages.append(AIMessage(content=history_messages[i + 1]))
+    invocation_messages.append(HumanMessage(content=user_message))
 
     try:
-        response = llm.invoke(
-            [
-                SystemMessage(content=SYSTEM_PROMPT_FOR_UNKNOWN_NODE),
-                HumanMessage(content=user_message),
-            ]
-        )
+        response = llm.invoke(invocation_messages)
 
         return {
             "hotel_results": [],
