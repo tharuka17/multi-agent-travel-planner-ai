@@ -2,42 +2,48 @@
 
 A FastAPI-based booking system with hotel and flight agents powered by LangChain.
 
-## Structure
-
-```
-backend/
-├── req/
-│   └── requirements.txt    # Python dependencies
-├── agents/
-│   ├── hotel_agent.py     # Hotel booking agent
-│   ├── flight_agent.py    # Flight booking agent
-│   ├── orchestrator.py    # Routes queries to correct agent
-│   └── __init__.py
-├── app/
-│   └── main.py           # FastAPI app with endpoints
-├── llm.py              # LangChain ChatOpenAI
-├── config.py           # Config loader
-└── .env              # Environment variables
-```
 
 ## Setup
 
-### 1. Install Dependencies
+### 1. Create Virtual Environment
 ```bash
-cd backend/req
+python -m venv env
+```
+
+Activate the virtual environment:
+- **Windows (CMD)**:
+  ```bash
+  env\Scripts\activate
+  ```
+- **Windows (PowerShell)**:
+  ```bash
+  env\Scripts\Activate.ps1
+  ```
+- **macOS/Linux**:
+  ```bash
+  source env/bin/activate
+  ```
+
+### 2. Install Dependencies
+```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure API Key
-Edit `.env` and add your OpenAI API key:
+### 3. Configure API Key
+Create a `.env` file in the project root and add your OpenAI API key:
 ```
 OPENAI_API_KEY=your_actual_api_key_here
 ```
 
-### 3. Run the Server
+### 4. Run the Backend
 ```bash
-cd backend
-uvicorn app.main:app --reload --port 8000
+python main.py
+```
+
+### 5. Run the Frontend
+In a new terminal (with the virtual environment activated):
+```bash
+python frontend.py
 ```
 
 ## API Endpoints
