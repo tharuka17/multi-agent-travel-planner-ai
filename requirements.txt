@@ -4,7 +4,11 @@ openai
 python-dotenv
 uvicorn
 gradio>=6.0
+httpx
+requests
 langchain
 langchain-openai
 langchain-core
 langgraph
+mcp
+langchain-mcp-adapters
