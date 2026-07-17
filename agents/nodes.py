@@ -1,514 +1,230 @@
-from typing import Optional, Literal
+import json
+from typing import Literal
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import BaseTool
+from langgraph.config import get_stream_writer
 from pydantic import BaseModel, Field
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
-from .tools import get_hotels, search_hotel, book_hotel, get_flights, search_flights, book_flight
-from .llm import llm
-from .prompts import get_system_prompt_for_unknown_node, get_system_prompt_with_history
 from .entity import GraphState
+from .llm import llm
+from .mcp_client import get_flight_tools, get_hotel_tools
+from .prompts import (
+    FLIGHT_AGENT_SYSTEM_PROMPT,
+    GENERAL_QA_SYSTEM_PROMPT,
+    HOTEL_AGENT_SYSTEM_PROMPT,
+    INTENT_SYSTEM_PROMPT,
+    build_history_messages,
+)
 
 
-class TravelExtraction(BaseModel):
-    intent: Literal["hotel", "flight", "unknown"] = Field(
-        default="unknown",
-        description="Main user intent: hotel, flight, or unknown."
-    )
+# ---------------------------------------------------------------------------
+# Router: intent classification only (E2 — the graph decides, not a fixed path)
+# ---------------------------------------------------------------------------
 
-    sub_action: Literal["search", "list_all","book", "general"] = Field(
-        default="general",
-        description="Action type: search, list_all, book or general."
-    )
-
-    city: Optional[str] = Field(
-        default=None,
-        description="Hotel city name. Example: Mumbai, Colombo, Bangkok."
-    )
-
-    check_in: Optional[str] = Field(
-        default=None,
-        description="Hotel check-in date in YYYY-MM-DD format. Null if not provided."
-    )
-
-    check_out: Optional[str] = Field(
-        default=None,
-        description="Hotel check-out date in YYYY-MM-DD format. Null if not provided."
-    )
-
-    origin: Optional[str] = Field(
-        default=None,
-        description="Flight origin city or airport code. Example: BOM, CMB, Mumbai."
-    )
-
-    destination: Optional[str] = Field(
-        default=None,
-        description="Flight destination city or airport code. Example: DEL, BKK, Delhi."
-    )
-
-    flight_date: Optional[str] = Field(
-        default=None,
-        description="Flight date in YYYY-MM-DD format. Null if not provided."
-    )
-
-    hotel_id: Optional[str] = Field(
-        default=None,
-        description="ID of the hotel to book. Null if not provided."
-    )
-
-    guest_name: Optional[str] = Field(
-        default=None,
-        description="Guest full name for hotel booking. Null if not provided."
-    )
-
-    guest_email: Optional[str] = Field(
-        default=None,
-        description="Guest email for hotel booking. Null if not provided."
-    )
-
-    room_type: Optional[str] = Field(
-        default=None,
-        description="Hotel room type such as single, double, or suite. Null if not provided."
-    )
-
-    flight_id: Optional[str] = Field(
-        default=None,
-        description="ID of the flight to book. Null if not provided."
-    )
-
-    passenger_name: Optional[str] = Field(
-        default=None,
-        description="Passenger full name for flight booking. Null if not provided."
-    )
-
-    passenger_email: Optional[str] = Field(
-        default=None,
-        description="Passenger email for flight booking. Null if not provided."
+class IntentClassification(BaseModel):
+    intent: Literal["hotel", "flight", "general_qa"] = Field(
+        description="Which agent should handle this message."
     )
 
 
-travel_extractor = llm.with_structured_output(TravelExtraction)
+intent_classifier = llm.with_structured_output(IntentClassification)
 
 
-def router(state: GraphState) -> dict:
+def _extract_tool_result(raw) -> dict:
+    """Normalize an MCP tool call's return value back into the plain dict our
+    MCP servers actually return.
+
+    langchain-mcp-adapters' StructuredTool.ainvoke() does not hand back the
+    Python dict a FastMCP tool function returns — it hands back the MCP
+    content list (typically one text block containing that dict JSON-encoded).
+    Without unwrapping this, every `isinstance(tool_result, dict)` check below
+    would silently be False, so a real tool error would never set
+    `tool_error=True` and a real success would never populate
+    hotel_results/flight_results — even though the LLM itself still reads the
+    right text and responds sensibly. This keeps the *app-level* state (not
+    just the LLM's own reasoning) honest about what the tool actually returned.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        for block in raw:
+            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if text:
+                try:
+                    parsed = json.loads(text)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+    return {"error": True, "message": "Unexpected tool result format from MCP server."}
+
+
+def _build_messages(system_prompt: str, state: GraphState) -> list:
     user_message = state["messages"][-1]
-    history_messages = state["messages"][:-1]
-    
-    system_prompt = get_system_prompt_with_history("\n".join(history_messages))
+    history_lines = state["messages"][:-1]
 
-    invocation_messages = [SystemMessage(content=system_prompt)]
-    for i in range(0, len(history_messages), 2):
-        invocation_messages.append(HumanMessage(content=history_messages[i]))
-        if i + 1 < len(history_messages):
-            invocation_messages.append(AIMessage(content=history_messages[i + 1]))
-    invocation_messages.append(HumanMessage(content=user_message))
+    messages = [SystemMessage(content=system_prompt)]
+    for role, text in build_history_messages(history_lines):
+        messages.append(HumanMessage(content=text) if role == "user" else AIMessage(content=text))
+    messages.append(HumanMessage(content=user_message))
+    return messages
+
+
+async def router(state: GraphState) -> dict:
+    messages = _build_messages(INTENT_SYSTEM_PROMPT, state)
 
     try:
-        extracted = travel_extractor.invoke(invocation_messages)
-
-        data = extracted.dict()
-
+        result = await intent_classifier.ainvoke(messages)
+        intent = result.intent
     except Exception:
-        data = {
-            "intent": "unknown",
-            "sub_action": "general",
-            "city": None,
-            "check_in": None,
-            "check_out": None,
-            "origin": None,
-            "destination": None,
-            "flight_date": None,
-            "hotel_id": None,
-            "guest_name": None,
-            "guest_email": None,
-            "room_type": None,
-            "flight_id": None,
-            "passenger_name": None,
-            "passenger_email": None,
-        }
+        # E3: never let a classification failure crash the turn — fall back safely.
+        intent = "general_qa"
 
     return {
-        "intent": data.get("intent", "unknown"),
-        "sub_action": data.get("sub_action", "general"),
-
-        "city": data.get("city"),
-        "check_in": data.get("check_in"),
-        "check_out": data.get("check_out"),
-
-        "origin": data.get("origin"),
-        "destination": data.get("destination"),
-        "flight_date": data.get("flight_date"),
-
-        "hotel_id": data.get("hotel_id"),
-        "guest_name": data.get("guest_name"),
-        "guest_email": data.get("guest_email"),
-        "room_type": data.get("room_type"),
-
-        "flight_id": data.get("flight_id"),
-        "passenger_name": data.get("passenger_name"),
-        "passenger_email": data.get("passenger_email"),
-
+        "intent": intent,
+        "activity": "routing",
         "hotel_results": [],
         "flight_results": [],
         "response_text": "",
+        "tool_error": False,
     }
 
 
-
-def _format_hotel(hotel: dict) -> str:
-    name = hotel.get("name", "Unknown hotel")
-
-    city_data = hotel.get("city", "unknown city")
-    if isinstance(city_data, dict):
-        city = city_data.get("name", "unknown city")
-    else:
-        city = city_data
-
-    stars = hotel.get("stars", hotel.get("rating", "N/A"))
-    price = hotel.get("price", hotel.get("pricePerNight", "N/A"))
-    currency = hotel.get("currency", "USD")
-
-    available = hotel.get(
-        "available_rooms",
-        hotel.get("availableRooms", hotel.get("available", "N/A"))
-    )
-
-    return (
-        f"{name} in {city}, "
-        f"{stars} stars - {currency} {price}/night - "
-        f"{available} rooms"
-    )
+def route_after_intent(state: GraphState) -> str:
+    return state.get("intent", "general_qa")
 
 
-def _format_flight(flight: dict) -> str:
-    airline = flight.get("airline", "Unknown airline")
+# ---------------------------------------------------------------------------
+# Shared tool-calling loop used by both the Hotel Agent and the Flight Agent.
+# Each agent reasons over the conversation, picks a tool (or asks a follow-up
+# question instead of guessing), calls it via MCP, then composes the final
+# reply from the real tool result. This is what makes E2 "agent decides" real
+# rather than a router pre-filling slots.
+# ---------------------------------------------------------------------------
 
-    number = flight.get(
-        "flightNumber",
-        flight.get("flight_number", flight.get("flightNo", "N/A"))
-    )
-
-    origin_data = flight.get("origin", "unknown")
-    destination_data = flight.get("destination", "unknown")
-
-    if isinstance(origin_data, dict):
-        origin = origin_data.get("airport", origin_data.get("city", "unknown"))
-    else:
-        origin = origin_data
-
-    if isinstance(destination_data, dict):
-        destination = destination_data.get("airport", destination_data.get("city", "unknown"))
-    else:
-        destination = destination_data
-
-    flight_date = flight.get(
-        "flightDate",
-        flight.get("date", flight.get("departure_date", "unknown"))
-    )
-
-    departure_time = flight.get(
-        "departureTime",
-        flight.get("departure_time", "N/A")
-    )
-
-    arrival_time = flight.get(
-        "arrivalTime",
-        flight.get("arrival_time", "N/A")
-    )
-
-    price = flight.get("price", "N/A")
-    currency = flight.get("currency", "USD")
-
-    seats = flight.get(
-        "availableSeats",
-        flight.get("available_seats", flight.get("seats", "N/A"))
-    )
-
-    return (
-        f"{airline} {number} from {origin} to {destination} "
-        f"on {flight_date}, {departure_time} - {arrival_time} "
-        f"- {currency} {price} - {seats} seats"
-    )
-
-
-
-def hotel_node(state: GraphState) -> dict:
-    city = state.get("city")
-    check_in = state.get("check_in")
-    check_out = state.get("check_out")
-
-    if state.get("sub_action") == "book":
-        hotel_id = state.get("hotel_id")
-        guest_name = state.get("guest_name")
-        guest_email = state.get("guest_email")
-        room_type = state.get("room_type")
-        check_in_date = state.get("check_in")
-        check_out_date = state.get("check_out")
-
-        missing = [
-            field
-            for field, value in [
-                ("hotel_id", hotel_id),
-                ("guest_name", guest_name),
-                ("guest_email", guest_email),
-                ("check_in", check_in_date),
-                ("check_out", check_out_date),
-                ("room_type", room_type),
-            ]
-            if not value
-        ]
-
-        if missing:
-            return {
-                "hotel_results": [],
-                "flight_results": [],
-                "response_text": (
-                    "I need more details to book the hotel. "
-                    "Please provide hotel_id, guest_name, guest_email, room_type, "
-                    "check_in, and check_out."
-                ),
-            }
-
-        result = book_hotel.invoke(
-            {
-                "hotel_id": hotel_id,
-                "guest_name": guest_name,
-                "guest_email": guest_email,
-                "check_in_date": check_in_date,
-                "check_out_date": check_out_date,
-                "room_type": room_type,
-            }
-        )
-
-    elif city:
-        params = {
-            "city": city,
-        }
-
-        if check_in:
-            params["checkIn"] = check_in
-
-        if check_out:
-            params["checkOut"] = check_out
-
-        result = search_hotel.invoke(params)
-
-    else:
-        result = get_hotels.invoke({})
-
-    if state.get("sub_action") == "book":
-        if isinstance(result, dict):
-            confirmation = result.get("message") or result.get("status") or "Hotel booking completed."
-            return {
-                "hotel_results": [],
-                "flight_results": [],
-                "response_text": confirmation,
-            }
-
-        return {
-            "hotel_results": [],
-            "flight_results": [],
-            "response_text": "Hotel booking completed.",
-        }
-
-    if isinstance(result, dict):
-        hotel_results = result.get("hotels", [])
-    elif isinstance(result, list):
-        hotel_results = result
-    else:
-        hotel_results = []
-
-    if not hotel_results:
-        return {
-            "hotel_results": [],
-            "flight_results": [],
-            "response_text": (
-                "I couldn't find any hotels. "
-                "Try searching by city, for example: 'available hotels in Mumbai'."
-            ),
-        }
-
-    return {
-        "hotel_results": hotel_results,
-        "flight_results": [],
-        "response_text": "",
-    }
-
-
-def flight_node(state: GraphState) -> dict:
-    origin = state.get("origin")
-    destination = state.get("destination")
-    flight_date = state.get("flight_date")
-
-    if state.get("sub_action") == "book":
-        flight_id = state.get("flight_id")
-        passenger_name = state.get("passenger_name")
-        passenger_email = state.get("passenger_email")
-
-        missing = [
-            field
-            for field, value in [
-                ("flight_id", flight_id),
-                ("passenger_name", passenger_name),
-                ("passenger_email", passenger_email),
-            ]
-            if not value
-        ]
-
-        if missing:
-            return {
-                "hotel_results": [],
-                "flight_results": [],
-                "response_text": (
-                    "I need more details to book the flight. "
-                    "Please provide flight_id, passenger_name, and passenger_email."
-                ),
-            }
-
-        result = book_flight.invoke(
-            {
-                "flight_id": flight_id,
-                "passenger_name": passenger_name,
-                "passenger_email": passenger_email,
-            }
-        )
-
-    elif origin and destination:
-        params = {
-            "origin": origin,
-            "destination": destination,
-        }
-
-        if flight_date:
-            params["date"] = flight_date
-
-        result = search_flights.invoke(params)
-
-    elif origin or destination:
-        return {
-            "hotel_results": [],
-            "flight_results": [],
-            "response_text": (
-                "I need both departure and destination information. "
-                "For example: 'flight from BOM to DEL'."
-            ),
-        }
-
-    else:
-        result = get_flights.invoke({})
-
-    if state.get("sub_action") == "book":
-        if isinstance(result, dict):
-            confirmation = result.get("message") or result.get("status") or "Flight booking completed."
-            return {
-                "hotel_results": [],
-                "flight_results": [],
-                "response_text": confirmation,
-            }
-
-        return {
-            "hotel_results": [],
-            "flight_results": [],
-            "response_text": "Flight booking completed.",
-        }
-
-    if isinstance(result, dict):
-        flight_results = result.get("flights", [])
-    elif isinstance(result, list):
-        flight_results = result
-    else:
-        flight_results = []
-
-    if not flight_results:
-        return {
-            "hotel_results": [],
-            "flight_results": [],
-            "response_text": (
-                "I couldn't find flights matching your request. "
-                "Try another route or ask for all flights."
-            ),
-        }
-
-    return {
-        "hotel_results": [],
-        "flight_results": flight_results,
-        "response_text": "",
-    }
-
-
-def unknown_node(state: GraphState) -> dict:
-    user_message = state["messages"][-1]
-    history_messages = state["messages"][:-1]
-
-    system_prompt = get_system_prompt_for_unknown_node("\n".join(history_messages))
-
-    invocation_messages = [SystemMessage(content=system_prompt)]
-    for i in range(0, len(history_messages), 2):
-        invocation_messages.append(HumanMessage(content=history_messages[i]))
-        if i + 1 < len(history_messages):
-            invocation_messages.append(AIMessage(content=history_messages[i + 1]))
-    invocation_messages.append(HumanMessage(content=user_message))
+async def _run_tool_calling_agent(
+    state: GraphState,
+    system_prompt: str,
+    tools: list[BaseTool],
+    result_key: str,  # "hotel_results" or "flight_results"
+    node_name: str,  # "hotel_agent" or "flight_agent", for activity events
+) -> dict:
+    base = {"hotel_results": [], "flight_results": [], "response_text": "", "tool_error": False}
 
     try:
-        response = llm.invoke(invocation_messages)
+        messages = _build_messages(system_prompt, state)
+        llm_with_tools = llm.bind_tools(tools)
+        ai_msg = await llm_with_tools.ainvoke(messages)
+
+        # No tool call chosen -> the agent is asking a clarifying question
+        # rather than fabricating data (spec section 4, step 6). Re-run as a
+        # plain streaming call (no tools bound) so the question streams
+        # token-by-token to the frontend, same as any other reply.
+        if not getattr(ai_msg, "tool_calls", None):
+            content = ""
+            async for chunk in llm.astream(messages):
+                content += chunk.content
+            return {**base, "activity": "clarifying", "response_text": content or ai_msg.content}
+
+        tools_by_name = {t.name: t for t in tools}
+        tool_messages = []
+        structured_results: list[dict] = []
+        had_error = False
+
+        # E2/section 6: SEARCHING vs BOOKING is a real intermediate state, not
+        # just metadata attached to the final response. Emit it *before* the
+        # tool call actually runs (via LangGraph's custom stream writer) so
+        # the frontend can show "Searching hotels…" / "Booking hotel…" while
+        # the MCP call is in flight, not only after the whole node finishes.
+        activity = "booking" if any("book" in c["name"] for c in ai_msg.tool_calls) else "searching"
+        try:
+            writer = get_stream_writer()
+            writer({"type": "activity", "node": node_name, "activity": activity})
+        except Exception:
+            pass  # custom stream writer only exists when invoked via .astream(); harmless if unavailable
+
+        for call in ai_msg.tool_calls:
+            tool = tools_by_name.get(call["name"])
+
+            if tool is None:
+                tool_result = {"error": True, "message": f"Unknown tool: {call['name']}"}
+            else:
+                try:
+                    raw_result = await tool.ainvoke(call["args"])
+                    tool_result = _extract_tool_result(raw_result)
+                except Exception as e:
+                    # E3: a failing MCP/external call degrades gracefully, never crashes.
+                    tool_result = {"error": True, "message": f"The service is temporarily unavailable ({e})."}
+
+            if isinstance(tool_result, dict) and tool_result.get("error"):
+                had_error = True
+            elif isinstance(tool_result, dict):
+                structured_results.extend(tool_result.get("hotels", []) or tool_result.get("flights", []) or [])
+
+            tool_messages.append(
+                ToolMessage(content=json.dumps(tool_result, default=str), tool_call_id=call["id"])
+            )
+
+        # Stream the final synthesis so tokens reach the frontend as they're
+        # generated, rather than waiting for the whole reply to complete.
+        final_content = ""
+        async for chunk in llm.astream([*messages, ai_msg, *tool_messages]):
+            final_content += chunk.content
 
         return {
-            "hotel_results": [],
-            "flight_results": [],
-            "response_text": response.content,
+            **base,
+            "activity": "responding",
+            "response_text": final_content,
+            "tool_error": had_error,
+            result_key: structured_results,
         }
 
     except Exception as e:
+        # E3: absolute last line of defense — the app must keep working.
+        return {
+            **base,
+            "activity": "responding",
+            "tool_error": True,
+            "response_text": (
+                "Sorry, something went wrong reaching that service just now. "
+                "Please try again in a moment."
+            ),
+        }
+
+
+async def hotel_agent_node(state: GraphState) -> dict:
+    tools = await get_hotel_tools()
+    return await _run_tool_calling_agent(state, HOTEL_AGENT_SYSTEM_PROMPT, tools, "hotel_results", "hotel_agent")
+
+
+async def flight_agent_node(state: GraphState) -> dict:
+    tools = await get_flight_tools()
+    return await _run_tool_calling_agent(state, FLIGHT_AGENT_SYSTEM_PROMPT, tools, "flight_results", "flight_agent")
+
+
+# ---------------------------------------------------------------------------
+# General QA agent — no tools, holds the conversation together (spec 2.2)
+# ---------------------------------------------------------------------------
+
+async def general_qa_node(state: GraphState) -> dict:
+    try:
+        messages = _build_messages(GENERAL_QA_SYSTEM_PROMPT, state)
+        content = ""
+        async for chunk in llm.astream(messages):
+            content += chunk.content
         return {
             "hotel_results": [],
             "flight_results": [],
-            "response_text": f"I couldn't understand your request clearly. Error: {str(e)}",
+            "activity": "responding",
+            "response_text": content,
+            "tool_error": False,
         }
-
-
-
-def generate_response(state: GraphState) -> dict:
-    if state.get("response_text"):
+    except Exception:
         return {
-            "response_text": state["response_text"]
+            "hotel_results": [],
+            "flight_results": [],
+            "activity": "responding",
+            "tool_error": True,
+            "response_text": "Sorry, I couldn't process that just now. Please try again.",
         }
-
-    hotel_results = state.get("hotel_results", [])
-    flight_results = state.get("flight_results", [])
-
-    if hotel_results:
-        count = len(hotel_results)
-        lines = [_format_hotel(hotel) for hotel in hotel_results[:5]]
-
-        return {
-            "response_text": (
-                f"I found {count} hotel option{'s' if count != 1 else ''}:\n"
-                + "\n".join(lines)
-            )
-        }
-
-    if flight_results:
-        count = len(flight_results)
-        lines = [_format_flight(flight) for flight in flight_results[:5]]
-
-        return {
-            "response_text": (
-                f"I found {count} flight option{'s' if count != 1 else ''}:\n"
-                + "\n".join(lines)
-            )
-        }
-
-    return {
-        "response_text": "I couldn't find matching travel options."
-    }
-
-
-def route_after_extraction(state: GraphState) -> str:
-    intent = state.get("intent", "unknown")
-
-    if intent == "hotel":
-        return "hotel"
-
-    if intent == "flight":
-        return "flight"
-
-    return "unknown"
