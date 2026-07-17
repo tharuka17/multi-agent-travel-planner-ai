@@ -1,0 +1,41 @@
+services:
+  # FastAPI backend + LangGraph agents
+  - type: web
+    name: tripweaver-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: HOTEL_MCP_URL
+        value: https://tripweaver-hotel-mcp.onrender.com/mcp
+      - key: FLIGHT_MCP_URL
+        value: https://tripweaver-flight-mcp.onrender.com/mcp
+
+  # Hotel MCP server — standalone process, only reachable by the backend
+  - type: web
+    name: tripweaver-hotel-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp_servers/hotel_server.py
+    envVars:
+      - key: HOTEL_MCP_HOST
+        value: 0.0.0.0
+      - key: HOTEL_API_BASE
+        value: https://standing-fish-574.convex.site/hotels
+
+  # Flight MCP server — standalone process, only reachable by the backend
+  - type: web
+    name: tripweaver-flight-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp_servers/flight_server.py
+    envVars:
+      - key: FLIGHT_MCP_HOST
+        value: 0.0.0.0
+      - key: FLIGHT_API_BASE
+        value: https://standing-fish-574.convex.site/flights

@@ -1,94 +1,251 @@
-# Booking Agents Backend
+# TripWeaver — MCP-Based Multi-Agent Travel Planner
 
-A FastAPI-based booking system with hotel and flight agents powered by LangChain.
+TripWeaver is a conversational travel planning assistant. A traveller chats in
+natural language; a LangGraph-orchestrated set of agents (General QA, Hotel,
+Flight) interprets intent, reaches live hotel/flight services **only through
+MCP (Model Context Protocol) tools**, and streams back a coherent reply.
 
+## Architecture
 
-## Setup
-
-### 1. Create Virtual Environment
-```bash
-python -m venv env
+```
+                     User input
+                         │
+                         ▼
+                  ┌─────────────┐
+                  │   Router    │   (intent classification only)
+                  └──────┬──────┘
+             ┌───────────┼───────────┐
+             ▼            ▼           ▼
+     ┌───────────┐ ┌────────────┐ ┌──────────────┐
+     │Hotel Agent│ │Flight Agent│ │General QA     │
+     │(tool-call)│ │(tool-call) │ │Agent (no tool)│
+     └─────┬─────┘ └─────┬──────┘ └──────────────┘
+           │             │
+           ▼             ▼
+   ┌───────────────┐ ┌───────────────┐
+   │ Hotel MCP      │ │ Flight MCP     │   ← separate processes
+   │ Server         │ │ Server         │
+   │ (list/search/  │ │ (list/search/  │
+   │  book hotel)   │ │  book flight)  │
+   └───────┬────────┘ └───────┬────────┘
+           ▼                  ▼
+      Hotel REST API     Flight REST API
 ```
 
-Activate the virtual environment:
-- **Windows (CMD)**:
-  ```bash
-  env\Scripts\activate
-  ```
-- **Windows (PowerShell)**:
-  ```bash
-  env\Scripts\Activate.ps1
-  ```
-- **macOS/Linux**:
-  ```bash
-  source env/bin/activate
-  ```
+**Why this shape:** the Hotel and Flight agents never call a REST API
+directly — they call MCP tools (`list_hotels`, `search_hotels`, `book_hotel`,
+etc). The MCP servers are the *only* code that knows the third-party API
+exists. Swapping the hotel provider, or adding a brand-new service (e.g.
+weather), means writing a new MCP server and pointing `HOTEL_MCP_URL` /
+adding a new URL — no agent code changes.
 
-### 2. Install Dependencies
+Each Hotel/Flight agent is a real tool-calling agent: given the conversation,
+it decides for itself whether to call `list`, `search`, or `book`, or whether
+it needs to ask the user a follow-up question first — it isn't handed
+pre-extracted slots by the router. The router's only job is intent
+classification (hotel / flight / general_qa).
+
+## Project layout
+
+```
+agents/
+  entity.py       Shared LangGraph state (GraphState) — single source of truth
+                  passed between nodes, including the current "activity"
+                  (routing/searching/booking/clarifying/responding).
+  graph.py        LangGraph StateGraph wiring: router → {hotel_agent,
+                  flight_agent, general_qa_agent}.
+  nodes.py        Node functions. Router does intent classification only;
+                  hotel_agent_node/flight_agent_node run a real tool-calling
+                  loop against MCP tools; general_qa_node is a plain LLM.
+  mcp_client.py   The ONLY place agent code knows how to reach the MCP
+                  servers (MultiServerMCPClient config).
+  llm.py          LLM initialisation (OpenAI, override with your own).
+  prompts.py      System prompts for intent classification + each agent.
+mcp_servers/
+  hotel_server.py  Standalone MCP server exposing list_hotels/search_hotels/
+                   book_hotel. The only code that calls the hotel REST API.
+  flight_server.py Standalone MCP server exposing list_flights/search_flights/
+                   book_flight. The only code that calls the flight REST API.
+main.py            FastAPI backend: /chat (blocking), /chat/stream (SSE
+                   streaming with activity + token events), /hotels, /flights.
+frontend.py        Gradio chat UI: streams tokens, shows activity cues,
+                   travel-themed responsive layout.
+app.py             Hugging Face Spaces entrypoint (delegates to frontend.py).
+render.yaml        Render Blueprint: deploys backend + both MCP servers as
+                   three separate services.
+```
+
+## Local setup
+
+### 1. Clone and install
+
 ```bash
+git clone <your-repo-url>
+cd multi-agent-travel-planner-main
+python -m venv env
+source env/bin/activate    # Windows: env\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure API Key
-Create a `.env` file in the project root and add your OpenAI API key:
-```
-OPENAI_API_KEY=your_actual_api_key_here
+### 2. Configure environment
+
+```bash
+cp .env.example .env
 ```
 
-### 4. Run the Backend
+Edit `.env` and set at minimum `OPENAI_API_KEY`. The MCP URLs already default
+to `http://127.0.0.1:8001/mcp` and `http://127.0.0.1:8002/mcp` for local dev.
+
+### 3. Run all four processes (separate terminals)
+
 ```bash
+# Terminal 1 — Hotel MCP server
+python mcp_servers/hotel_server.py
+
+# Terminal 2 — Flight MCP server
+python mcp_servers/flight_server.py
+
+# Terminal 3 — FastAPI backend (agents + graph)
 python main.py
-```
 
-### 5. Run the Frontend
-In a new terminal (with the virtual environment activated):
-```bash
+# Terminal 4 — Gradio frontend
 python frontend.py
 ```
 
-## API Endpoints
+Open the local Gradio URL printed in Terminal 4.
 
-| Endpoint | Method | Description | Example |
-|----------|--------|-------------|---------|
-| `/hotels` | GET | Get all hotels | `curl http://localhost:8000/hotels` |
-| `/flights` | GET | Get all flights | `curl http://localhost:8000/flights` |
-| `/chat` | POST | Chat with agent | See below |
+### 4. Quick smoke test (no frontend needed)
 
-### Chat Example
+Once the MCP servers and backend are running:
 
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -d '{"message": "find me a hotel in NYC"}'
+  -d '{"message": "show me all hotels"}'
 ```
 
-**Other queries to try:**
-- "show me all hotels"
-- "book a hotel in Miami"
-- "find flights from New York to London"
-- "show all flights"
+Or check MCP tool discovery directly:
 
-## Gradio Chat UI
+```python
+import asyncio
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
-A simple Gradio chat interface is available in `gradio_app.py`.
+async def main():
+    client = MultiServerMCPClient({
+        "hotel": {"url": "http://127.0.0.1:8001/mcp", "transport": "streamable_http"},
+        "flight": {"url": "http://127.0.0.1:8002/mcp", "transport": "streamable_http"},
+    })
+    tools = await client.get_tools()
+    for t in tools:
+        print(t.name)
 
-Run the FastAPI backend first:
-
-```bash
-python main.py
+asyncio.run(main())
 ```
 
-Then start the Gradio UI:
+You should see: `list_hotels, search_hotels, book_hotel, list_flights,
+search_flights, book_flight`.
 
-```bash
-python gradio_app.py
-```
+## MCP Server Setup Guide
 
-Open the local Gradio URL shown in the terminal and ask for flights or hotels.
+Each MCP server is a standalone Python process built with the official MCP
+Python SDK's `FastMCP` class, run over the `streamable-http` transport so it's
+reachable over a normal URL (rather than stdio, which only works for
+same-machine subprocess integration).
 
-## Tech Stack
+**To add a new capability to an existing server:** add a new `@mcp.tool()`
+decorated function in `mcp_servers/hotel_server.py` or `flight_server.py` —
+nothing elsewhere needs to change; the agent will discover it automatically
+next time tools are (re)fetched.
 
-- **FastAPI** - Web framework
-- **LangChain** - Agent framework
-- **OpenAI** - LLM (GPT-4o-mini)
-- **python-dotenv** - Environment config
+**To add a brand-new service** (e.g. a weather MCP server): create
+`mcp_servers/weather_server.py` following the same pattern, deploy it, add its
+URL to `agents/mcp_client.py`, and give a new agent node access to
+`await get_weather_tools()`. No existing agent/graph code changes.
+
+**Environment variables per MCP server:**
+| Variable | Server | Purpose |
+|---|---|---|
+| `HOTEL_API_BASE` | hotel | Upstream hotel REST API base URL |
+| `HOTEL_MCP_HOST` / `PORT` | hotel | Bind address/port |
+| `FLIGHT_API_BASE` | flight | Upstream flight REST API base URL |
+| `FLIGHT_MCP_HOST` / `PORT` | flight | Bind address/port |
+
+## Deployment
+
+### Backend + MCP servers → Render
+
+This repo includes `render.yaml`, a Render Blueprint that deploys three
+separate services from the same repo:
+
+1. Push this repo to GitHub.
+2. In Render, choose **New → Blueprint**, point it at your repo. Render will
+   read `render.yaml` and propose all three services.
+3. Set the `OPENAI_API_KEY` secret on `tripweaver-backend` when prompted.
+4. Deploy. Render assigns public URLs to all three services automatically.
+5. **Important:** `render.yaml` hardcodes the expected MCP URLs
+   (`https://tripweaver-hotel-mcp.onrender.com/mcp` etc). If Render assigns
+   different service names/subdomains, update `HOTEL_MCP_URL` /
+   `FLIGHT_MCP_URL` on the backend service to match the real deployed URLs,
+   then redeploy the backend.
+
+If you'd rather not use the Blueprint, create the three services manually as
+regular Web Services pointing at this repo, using the `startCommand` values
+from `render.yaml` for each.
+
+### Frontend → Hugging Face Spaces
+
+1. Create a new Space, SDK = Gradio.
+2. Push this repo's contents to the Space (it will use `app.py` as the
+   entrypoint automatically).
+3. In the Space's **Settings → Variables**, set:
+   ```
+   TRAVEL_PLANNER_API_URL = https://tripweaver-backend.onrender.com/chat/stream
+   ```
+4. The Space builds from `requirements.txt` and launches automatically.
+
+## User Guide
+
+Just type naturally — no special syntax or agent names needed:
+
+- **General questions:** *"What's a good time of year to visit Thailand?"*
+- **Browse:** *"Show me all hotels"* / *"Show me all flights"*
+- **Search:** *"Find hotels in Colombo from 2026-08-01 to 2026-08-05"*,
+  *"Flights from CMB to BKK on 2026-08-10"*
+- **Book:** *"Book hotel H123 for John Doe, john@example.com, double room,
+  2026-08-01 to 2026-08-05"* — if you leave out required details, the Hotel/
+  Flight Agent will ask for exactly what's missing rather than guessing.
+
+While the assistant works you'll see live activity cues (*"Searching…"*,
+*"Booking…"*) before the streamed reply appears. If an external service is
+temporarily unavailable, you'll get a clear, friendly message instead of an
+error page — the rest of the app keeps working.
+
+## Design trade-offs (for viva discussion)
+
+- **Single-round tool calling per turn:** each Hotel/Flight agent call makes
+  at most one round of tool calls before composing its final answer, rather
+  than an open-ended ReAct loop. This keeps behaviour predictable and easy to
+  reason about for an MVP; a multi-step itinerary (combining hotel + flight
+  results) is a natural stretch extension on top of this same structure.
+- **Streaming (three LangGraph stream modes combined):** `main.py` calls
+  `graph.astream(..., stream_mode=["updates", "messages", "custom"])`.
+  `"updates"` reports each node's activity once it finishes (ROUTING,
+  RESPONDING, CLARIFYING). `"messages"` surfaces real LLM tokens from
+  `llm.astream(...)` inside a node. `"custom"` is what makes SEARCHING and
+  BOOKING visible while a tool call is still in flight, not only after the
+  whole node returns: `agents/nodes.py` calls LangGraph's
+  `get_stream_writer()` immediately before invoking an MCP tool to emit that
+  intermediate state. A defensive word-by-word fallback in `main.py` also
+  chunks the final text if no native token events are observed for a turn,
+  so the UI never regresses to one giant blob.
+- **MCP result normalization:** `langchain-mcp-adapters`' `tool.ainvoke()`
+  returns MCP's raw content-block list (e.g. `[{"type": "text", "text":
+  "<json>"}]`), not the Python dict the MCP server function actually
+  returned. `agents/nodes.py`'s `_extract_tool_result()` unwraps this back
+  into a plain dict before checking for `error`/`hotels`/`flights` keys —
+  otherwise `tool_error` and the structured `hotel_results`/`flight_results`
+  would silently never populate, even though the LLM itself would still read
+  the tool's JSON text fine and respond sensibly.
+- **Two MCP servers, not one:** matches the spec's proposed architecture and
+  gives a concrete decoupling story — either service can be redeployed,
+  scaled, or replaced independently of the other and of the backend.
