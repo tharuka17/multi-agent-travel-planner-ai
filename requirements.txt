@@ -3,7 +3,7 @@ pydantic
 openai
 python-dotenv
 uvicorn
-gradio
+gradio>=6.0
 langchain
 langchain-openai
 langchain-core
