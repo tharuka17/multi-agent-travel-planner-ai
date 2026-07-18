@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, TypedDict
+from typing import Annotated, List, Literal, Optional, TypedDict
 
 
 # Activity states from the spec's Agent Activity & Tool-Call Lifecycle (section 6).
@@ -7,11 +7,21 @@ from typing import List, Literal, Optional, TypedDict
 ActivityState = Literal["routing", "searching", "booking", "responding", "clarifying"]
 
 
+def _append_turns(existing: List[str], new: List[str]) -> List[str]:
+    """Reducer for `messages`: each graph.ainvoke() call submits only the
+    *new* turn(s) for this request (e.g. just the latest user message); this
+    appends them onto whatever LangGraph's checkpointer has already persisted
+    for this thread_id, instead of overwriting it. This is what makes
+    multi-turn memory work — every other GraphState key intentionally has NO
+    reducer (default overwrite), since those (hotel_results, activity, etc.)
+    should reset fresh each turn, not accumulate.
+    """
+    return (existing or []) + (new or [])
+
+
 class GraphState(TypedDict):
     # Full raw conversation so far, alternating user/assistant strings.
-    # This is the single source of truth passed between nodes (per spec section 7:
-    # "all inter-agent communication flows through the shared agent state schema").
-    messages: List[str]
+    messages: Annotated[List[str], _append_turns]
 
     # Set by the router node. Drives which agent node the graph dispatches to.
     intent: Literal["hotel", "flight", "general_qa"]

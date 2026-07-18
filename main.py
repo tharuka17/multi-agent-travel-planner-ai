@@ -9,8 +9,6 @@ from agents.graph import graph
 from agents.mcp_client import get_flight_tools, get_hotel_tools
 from agents.nodes import _extract_tool_result
 
-conversation_history_messages = []
-
 app = FastAPI(title="TripWeaver API")
 
 app.add_middleware(
@@ -46,15 +44,17 @@ async def list_flights():
 
 
 def _build_initial_state(message: str) -> dict:
-    recent_pairs = conversation_history_messages[-3:]
-    flattened_messages = []
-    for user_msg, assistant_msg in recent_pairs:
-        flattened_messages.append(user_msg)
-        flattened_messages.append(assistant_msg)
-    flattened_messages.append(message)
-
+    # Only the *new* turn is submitted here — the graph's checkpointer
+    # (agents/graph.py) already holds everything before it for this
+    # thread_id, and entity.py's `messages` reducer appends this onto that
+    # persisted history rather than replacing it. This is also what fixes a
+    # real bug from before memory/context existed: the old approach kept a
+    # single module-level `conversation_history_messages` list shared by
+    # every request the process ever handled, across all users/sessions —
+    # there was no actual per-conversation isolation. Per-thread_id state
+    # here fixes that alongside adding the stretch feature.
     return {
-        "messages": flattened_messages,
+        "messages": [message],
         "intent": "general_qa",
         "activity": "routing",
         "hotel_results": [],
@@ -69,10 +69,10 @@ async def chat(request: ChatRequest):
     """Non-streaming chat endpoint. Simple request/response — useful for
     curl/testing and for any client that doesn't need live token streaming."""
     initial_state = _build_initial_state(request.message)
-    result = await graph.ainvoke(initial_state)
+    config = {"configurable": {"thread_id": request.thread_id}}
+    result = await graph.ainvoke(initial_state, config=config)
 
     response_text = result.get("response_text") or "Something went wrong. Please try again."
-    conversation_history_messages.append((request.message, response_text))
 
     return ChatResponse(
         response=response_text,
@@ -99,13 +99,15 @@ async def chat_stream(request: ChatRequest):
     result (final text + any hotel/flight results + whether a tool errored).
     """
     initial_state = _build_initial_state(request.message)
+    config = {"configurable": {"thread_id": request.thread_id}}
 
     async def event_generator():
         final_payload: dict = {}
+        final_intent = None
         streamed_any_token = False
         try:
             async for mode, chunk in graph.astream(
-                initial_state, stream_mode=["updates", "messages", "custom"]
+                initial_state, config=config, stream_mode=["updates", "messages", "custom"]
             ):
                 if mode == "updates":
                     for node_name, node_output in chunk.items():
@@ -114,6 +116,8 @@ async def chat_stream(request: ChatRequest):
                         activity = node_output.get("activity")
                         if activity:
                             yield _sse({"type": "activity", "node": node_name, "activity": activity})
+                        if node_name == "router":
+                            final_intent = node_output.get("intent")
                         if node_name in ("hotel_agent", "flight_agent", "general_qa_agent"):
                             final_payload = node_output
 
@@ -150,14 +154,23 @@ async def chat_stream(request: ChatRequest):
             return
 
         response_text = final_payload.get("response_text") or "Something went wrong. Please try again."
-        conversation_history_messages.append((request.message, response_text))
+
+        # hotels/flights: pass the real list through as-is (even if empty) when
+        # this turn's intent was hotel/flight — an empty list means "searched,
+        # found nothing" which the frontend renders as a real empty state,
+        # distinct from `null` meaning "not applicable this turn" (e.g. a
+        # general_qa turn). Collapsing [] to null here would make those two
+        # cases indistinguishable to the frontend.
+        hotels = final_payload.get("hotel_results", []) if final_intent == "hotel" else None
+        flights = final_payload.get("flight_results", []) if final_intent == "flight" else None
 
         yield _sse(
             {
                 "type": "done",
                 "response_text": response_text,
-                "hotels": final_payload.get("hotel_results") or None,
-                "flights": final_payload.get("flight_results") or None,
+                "intent": final_intent,
+                "hotels": hotels,
+                "flights": flights,
                 "tool_error": final_payload.get("tool_error", False),
             }
         )

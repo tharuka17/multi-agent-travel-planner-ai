@@ -1,7 +1,9 @@
 import json
+import time
 from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.config import get_stream_writer
 from pydantic import BaseModel, Field
@@ -9,6 +11,7 @@ from pydantic import BaseModel, Field
 from .entity import GraphState
 from .llm import llm
 from .mcp_client import get_flight_tools, get_hotel_tools
+from .observability import log_routing_decision, timed_tool_call
 from .prompts import (
     FLIGHT_AGENT_SYSTEM_PROMPT,
     GENERAL_QA_SYSTEM_PROMPT,
@@ -71,15 +74,18 @@ def _build_messages(system_prompt: str, state: GraphState) -> list:
     return messages
 
 
-async def router(state: GraphState) -> dict:
+async def router(state: GraphState, config: RunnableConfig) -> dict:
+    thread_id = config["configurable"].get("thread_id", "default")
     messages = _build_messages(INTENT_SYSTEM_PROMPT, state)
 
+    start = time.perf_counter()
     try:
         result = await intent_classifier.ainvoke(messages)
         intent = result.intent
     except Exception:
         # E3: never let a classification failure crash the turn — fall back safely.
         intent = "general_qa"
+    log_routing_decision(thread_id, intent, (time.perf_counter() - start) * 1000)
 
     return {
         "intent": intent,
@@ -105,11 +111,13 @@ def route_after_intent(state: GraphState) -> str:
 
 async def _run_tool_calling_agent(
     state: GraphState,
+    config: RunnableConfig,
     system_prompt: str,
     tools: list[BaseTool],
     result_key: str,  # "hotel_results" or "flight_results"
     node_name: str,  # "hotel_agent" or "flight_agent", for activity events
 ) -> dict:
+    thread_id = config["configurable"].get("thread_id", "default")
     base = {"hotel_results": [], "flight_results": [], "response_text": "", "tool_error": False}
 
     try:
@@ -125,7 +133,8 @@ async def _run_tool_calling_agent(
             content = ""
             async for chunk in llm.astream(messages):
                 content += chunk.content
-            return {**base, "activity": "clarifying", "response_text": content or ai_msg.content}
+            reply = content or ai_msg.content
+            return {**base, "activity": "clarifying", "response_text": reply, "messages": [reply]}
 
         tools_by_name = {t.name: t for t in tools}
         tool_messages = []
@@ -150,12 +159,15 @@ async def _run_tool_calling_agent(
             if tool is None:
                 tool_result = {"error": True, "message": f"Unknown tool: {call['name']}"}
             else:
-                try:
-                    raw_result = await tool.ainvoke(call["args"])
-                    tool_result = _extract_tool_result(raw_result)
-                except Exception as e:
-                    # E3: a failing MCP/external call degrades gracefully, never crashes.
-                    tool_result = {"error": True, "message": f"The service is temporarily unavailable ({e})."}
+                with timed_tool_call(thread_id, node_name, call["name"]) as mark_status:
+                    try:
+                        raw_result = await tool.ainvoke(call["args"])
+                        tool_result = _extract_tool_result(raw_result)
+                        mark_status("failed" if tool_result.get("error") else "succeeded")
+                    except Exception as e:
+                        # E3: a failing MCP/external call degrades gracefully, never crashes.
+                        tool_result = {"error": True, "message": f"The service is temporarily unavailable ({e})."}
+                        mark_status("failed")
 
             if isinstance(tool_result, dict) and tool_result.get("error"):
                 had_error = True
@@ -176,31 +188,38 @@ async def _run_tool_calling_agent(
             **base,
             "activity": "responding",
             "response_text": final_content,
+            "messages": [final_content],
             "tool_error": had_error,
             result_key: structured_results,
         }
 
     except Exception as e:
         # E3: absolute last line of defense — the app must keep working.
+        fallback = (
+            "Sorry, something went wrong reaching that service just now. "
+            "Please try again in a moment."
+        )
         return {
             **base,
             "activity": "responding",
             "tool_error": True,
-            "response_text": (
-                "Sorry, something went wrong reaching that service just now. "
-                "Please try again in a moment."
-            ),
+            "response_text": fallback,
+            "messages": [fallback],
         }
 
 
-async def hotel_agent_node(state: GraphState) -> dict:
+async def hotel_agent_node(state: GraphState, config: RunnableConfig) -> dict:
     tools = await get_hotel_tools()
-    return await _run_tool_calling_agent(state, HOTEL_AGENT_SYSTEM_PROMPT, tools, "hotel_results", "hotel_agent")
+    return await _run_tool_calling_agent(
+        state, config, HOTEL_AGENT_SYSTEM_PROMPT, tools, "hotel_results", "hotel_agent"
+    )
 
 
-async def flight_agent_node(state: GraphState) -> dict:
+async def flight_agent_node(state: GraphState, config: RunnableConfig) -> dict:
     tools = await get_flight_tools()
-    return await _run_tool_calling_agent(state, FLIGHT_AGENT_SYSTEM_PROMPT, tools, "flight_results", "flight_agent")
+    return await _run_tool_calling_agent(
+        state, config, FLIGHT_AGENT_SYSTEM_PROMPT, tools, "flight_results", "flight_agent"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,13 +237,16 @@ async def general_qa_node(state: GraphState) -> dict:
             "flight_results": [],
             "activity": "responding",
             "response_text": content,
+            "messages": [content],
             "tool_error": False,
         }
     except Exception:
+        fallback = "Sorry, I couldn't process that just now. Please try again."
         return {
             "hotel_results": [],
             "flight_results": [],
             "activity": "responding",
             "tool_error": True,
-            "response_text": "Sorry, I couldn't process that just now. Please try again.",
+            "response_text": fallback,
+            "messages": [fallback],
         }
