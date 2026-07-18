@@ -9,6 +9,7 @@ instead of raw stack traces.
 
 import json
 import os
+import pathlib
 import uuid
 
 import gradio as gr
@@ -227,9 +228,10 @@ def main():
         # button can resend it without the user retyping anything.
         last_message = gr.State("")
 
+        BOT_AVATAR = str(pathlib.Path(__file__).parent / "assets" / "bot_avatar.svg")
         chatbot = gr.Chatbot(
             height=520,
-            avatar_images=(None, "✈️"),
+            avatar_images=(None, BOT_AVATAR),
             buttons=["copy"],
         )
         with gr.Row():

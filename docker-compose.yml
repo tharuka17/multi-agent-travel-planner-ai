@@ -1,0 +1,55 @@
+# Stretch: Containerisation. Brings up all four TripWeaver processes with one
+# command: `docker compose up --build`. Mirrors the same four-process
+# architecture as the Render deployment (render.yaml) and local dev (README
+# "Run all four processes" section) — just containerized instead of run
+# directly on the host. Reuses the single Dockerfile for all four services;
+# each block below only overrides the command and networking.
+
+services:
+  hotel-mcp:
+    build: .
+    command: python mcp_servers/hotel_server.py
+    environment:
+      HOTEL_MCP_HOST: 0.0.0.0
+      HOTEL_MCP_PORT: 8001
+      HOTEL_API_BASE: https://standing-fish-574.convex.site/hotels
+    ports:
+      - "8001:8001"
+
+  flight-mcp:
+    build: .
+    command: python mcp_servers/flight_server.py
+    environment:
+      FLIGHT_MCP_HOST: 0.0.0.0
+      FLIGHT_MCP_PORT: 8002
+      FLIGHT_API_BASE: https://standing-fish-574.convex.site/flights
+    ports:
+      - "8002:8002"
+
+  backend:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    environment:
+      # Real secret comes from .env (git-ignored) via env_file below.
+      # Inter-service URLs use Docker Compose's service-name DNS (not
+      # 127.0.0.1) since these run in separate containers on one network.
+      HOTEL_MCP_URL: http://hotel-mcp:8001/mcp
+      FLIGHT_MCP_URL: http://flight-mcp:8002/mcp
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - hotel-mcp
+      - flight-mcp
+
+  frontend:
+    build: .
+    command: python frontend.py
+    environment:
+      TRAVEL_PLANNER_API_URL: http://backend:8000/chat/stream
+      PORT: 7860
+    ports:
+      - "7860:7860"
+    depends_on:
+      - backend
