@@ -1,0 +1,48 @@
+name: CI
+
+# Stretch: CI — automated checks on push. Deliberately lightweight (no
+# external services, no real OPENAI_API_KEY needed) so it runs fast and free
+# on every push/PR, catching the class of bug that actually broke a real
+# Render deploy during this project: a dependency used in code but missing
+# from requirements.txt. That failure only showed up as a ModuleNotFoundError
+# in Render's deploy logs — this workflow catches it here instead, before a
+# deploy is even attempted.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  syntax-and-import-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile-check every Python file (catches syntax errors)
+        run: python -m py_compile $(find . -name "*.py" -not -path "./.git/*")
+
+      - name: Import-smoke-test every entrypoint
+        # A fake key is enough — ChatOpenAI validates the key is *present*
+        # at construction time, not that it's valid, so this exercises every
+        # real import path (agents/*, main.py, frontend.py, mcp_servers/*)
+        # without needing real credentials or reaching any external API.
+        # This is exactly the check that would have caught the
+        # ModuleNotFoundError for langchain-mcp-adapters/mcp before it ever
+        # reached a Render deploy.
+        env:
+          OPENAI_API_KEY: sk-fake-for-ci
+        run: |
+          python -c "from agents.graph import graph; print('agents.graph OK')"
+          python -c "import main; print('main OK')"
+          python -c "import frontend; print('frontend OK')"
+          python -c "from mcp_servers.hotel_server import mcp; print('hotel_server OK')"
+          python -c "from mcp_servers.flight_server import mcp; print('flight_server OK')"
