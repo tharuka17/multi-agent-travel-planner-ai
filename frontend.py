@@ -9,6 +9,7 @@ instead of raw stack traces.
 
 import json
 import os
+import uuid
 
 import gradio as gr
 import httpx
@@ -24,10 +25,31 @@ ACTIVITY_LABELS = {
 }
 
 
-def format_hotels(hotels: list[dict]) -> str:
+def _card(title: str, subtitle: str, meta: str, badge_id: str) -> str:
+    return f"""
+<div class="tw-card">
+  <div class="tw-card-main">
+    <div class="tw-card-title">{title}</div>
+    <div class="tw-card-subtitle">{subtitle}</div>
+  </div>
+  <div class="tw-card-meta">{meta}</div>
+  <div class="tw-card-id">ID: {badge_id}</div>
+</div>
+""".strip()
+
+
+def build_hotel_cards_html(hotels: list[dict]) -> str:
+    """Stretch: result presentation — render hotel results as cards instead
+    of a plain bullet list. `hotels` is the raw list from the backend; an
+    empty (but non-None) list means the Hotel Agent genuinely searched and
+    found nothing, which gets its own empty-state card rather than silently
+    showing no results section at all."""
     if not hotels:
-        return ""
-    lines = ["**Hotels found:**"]
+        return (
+            '<div class="tw-empty-state">🏨 No hotels matched that search. '
+            "Try a different city or dates.</div>"
+        )
+    cards = []
     for hotel in hotels:
         name = hotel.get("name", "Unknown hotel")
         city = hotel.get("city", "")
@@ -36,14 +58,17 @@ def format_hotels(hotels: list[dict]) -> str:
         price = hotel.get("price", hotel.get("pricePerNight", "N/A"))
         currency = hotel.get("currency", "USD")
         hotel_id = hotel.get("_id", hotel.get("id", ""))
-        lines.append(f"- **{name}** ({hotel_id}) — {city} — {currency} {price}/night")
-    return "\n".join(lines)
+        cards.append(_card(f"🏨 {name}", str(city), f"{currency} {price}/night", str(hotel_id)))
+    return '<div class="tw-card-grid">' + "".join(cards) + "</div>"
 
 
-def format_flights(flights: list[dict]) -> str:
+def build_flight_cards_html(flights: list[dict]) -> str:
     if not flights:
-        return ""
-    lines = ["**Flights found:**"]
+        return (
+            '<div class="tw-empty-state">✈️ No flights matched that search. '
+            "Try a different route or date.</div>"
+        )
+    cards = []
     for flight in flights:
         airline = flight.get("airline", "Unknown airline")
         number = flight.get("flightNumber", flight.get("flight_number", "N/A"))
@@ -54,18 +79,20 @@ def format_flights(flights: list[dict]) -> str:
         price = flight.get("price", "N/A")
         currency = flight.get("currency", "USD")
         flight_id = flight.get("_id", flight.get("id", ""))
-        lines.append(
-            f"- **{airline} {number}** ({flight_id}) — {origin_code} → {dest_code} — {currency} {price}"
+        cards.append(
+            _card(f"✈️ {airline} {number}", f"{origin_code} → {dest_code}", f"{currency} {price}", str(flight_id))
         )
-    return "\n".join(lines)
+    return '<div class="tw-card-grid">' + "".join(cards) + "</div>"
 
 
-async def respond(message, history):
+async def respond(message, history, thread_id):
     if history is None:
         history = []
 
     history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
-    yield history, history
+    # Stretch: polish — last_message powers the Retry button below, so a
+    # failed turn can be resent without retyping it.
+    yield history, history, message
 
     streamed_text = ""
     activity_label = ""
@@ -73,14 +100,14 @@ async def respond(message, history):
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream(
-                "POST", API_URL, json={"message": message}
+                "POST", API_URL, json={"message": message, "thread_id": thread_id}
             ) as response:
                 if response.status_code != 200:
                     history[-1]["content"] = (
                         "⚠️ I couldn't reach the travel planner service right now. "
                         "Please try again shortly."
                     )
-                    yield history, history
+                    yield history, history, message
                     return
 
                 async for line in response.aiter_lines():
@@ -92,42 +119,46 @@ async def respond(message, history):
                     if event_type == "activity":
                         activity_label = ACTIVITY_LABELS.get(payload.get("activity"), "")
                         history[-1]["content"] = f"_{activity_label}_" if not streamed_text else streamed_text
-                        yield history, history
+                        yield history, history, message
 
                     elif event_type == "token":
                         streamed_text += payload.get("content", "")
                         history[-1]["content"] = streamed_text
-                        yield history, history
+                        yield history, history, message
 
                     elif event_type == "error":
                         history[-1]["content"] = (
                             f"⚠️ {payload.get('message', 'Something went wrong. Please try again.')}"
                         )
-                        yield history, history
+                        yield history, history, message
                         return
 
                     elif event_type == "done":
                         final_text = payload.get("response_text") or streamed_text
                         extra = []
-                        if payload.get("hotels"):
-                            extra.append(format_hotels(payload["hotels"]))
-                        if payload.get("flights"):
-                            extra.append(format_flights(payload["flights"]))
+                        # None = not applicable this turn (e.g. a general_qa
+                        # reply); [] = genuinely searched and found nothing,
+                        # which gets a real empty-state card, not silence.
+                        if payload.get("hotels") is not None:
+                            extra.append(build_hotel_cards_html(payload["hotels"]))
+                        if payload.get("flights") is not None:
+                            extra.append(build_flight_cards_html(payload["flights"]))
                         if payload.get("tool_error"):
                             extra.append(
-                                "_(Note: one of the travel services was temporarily unavailable — "
-                                "some information above may be incomplete.)_"
+                                '<div class="tw-error-note">⚠️ One of the travel services was '
+                                "temporarily unavailable — try again in a moment, or use the "
+                                "Retry button below to resend this message.</div>"
                             )
                         full_text = "\n\n".join([final_text] + [e for e in extra if e])
                         history[-1]["content"] = full_text
-                        yield history, history
+                        yield history, history, message
 
     except httpx.RequestError:
         history[-1]["content"] = (
             "⚠️ I couldn't reach the travel planner service right now. Please check your "
             "connection and try again."
         )
-        yield history, history
+        yield history, history, message
 
 
 THEME = gr.themes.Soft(
@@ -139,6 +170,43 @@ THEME = gr.themes.Soft(
 CUSTOM_CSS = """
 #tripweaver-header { text-align: center; margin-bottom: 0.5rem; }
 .gradio-container { max-width: 900px !important; margin: auto; }
+
+.tw-card-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+.tw-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border: 1px solid var(--border-color-primary, #d9dce3);
+  border-radius: 10px;
+  padding: 0.6rem 0.9rem;
+  background: var(--background-fill-secondary, #f7f9fc);
+}
+.tw-card-title { font-weight: 600; font-size: 0.95rem; }
+.tw-card-subtitle { font-size: 0.85rem; opacity: 0.75; }
+.tw-card-meta { font-weight: 600; white-space: nowrap; font-size: 0.9rem; }
+.tw-card-id { font-size: 0.7rem; opacity: 0.5; white-space: nowrap; }
+.tw-empty-state {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px dashed var(--border-color-primary, #d9dce3);
+  border-radius: 10px;
+  font-size: 0.9rem;
+  opacity: 0.8;
+}
+.tw-error-note {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 8px;
+  background: #fff4e5;
+  color: #8a5300;
+  font-size: 0.85rem;
+}
 """
 
 
@@ -149,6 +217,16 @@ def main():
             "### Your AI travel planning assistant — hotels, flights, and travel advice in one chat.",
             elem_id="tripweaver-header",
         )
+        # Stretch: Memory/context. One thread_id per browser session (regenerated
+        # only if the user explicitly resets), sent with every request so the
+        # backend's checkpointer (agents/graph.py) knows which conversation's
+        # history to load/persist — lets the traveller say "make it cheaper" or
+        # "different dates" without repeating earlier details.
+        thread_id = gr.State(lambda: str(uuid.uuid4()))
+        # Stretch: polish — remembers the last sent message so the Retry
+        # button can resend it without the user retyping anything.
+        last_message = gr.State("")
+
         chatbot = gr.Chatbot(
             height=520,
             avatar_images=(None, "✈️"),
@@ -163,6 +241,10 @@ def main():
             )
             submit = gr.Button("Send", scale=1, variant="primary")
 
+        with gr.Row():
+            new_chat = gr.Button("🔄 New conversation", size="sm")
+            retry = gr.Button("↻ Retry last message", size="sm")
+
         gr.Examples(
             examples=[
                 "What are some good destinations for a beach holiday in July?",
@@ -173,11 +255,23 @@ def main():
             inputs=message,
         )
 
-        submit.click(respond, inputs=[message, chatbot], outputs=[chatbot, chatbot]).then(
-            lambda: "", None, message
+        submit.click(
+            respond, inputs=[message, chatbot, thread_id], outputs=[chatbot, chatbot, last_message]
+        ).then(lambda: "", None, message)
+        message.submit(
+            respond, inputs=[message, chatbot, thread_id], outputs=[chatbot, chatbot, last_message]
+        ).then(lambda: "", None, message)
+        # Retry resends whatever `last_message` holds, as a new turn (not a
+        # silent replay) — visible in the chat like any other message, using
+        # the same thread_id so it's still part of the same conversation.
+        retry.click(
+            respond, inputs=[last_message, chatbot, thread_id], outputs=[chatbot, chatbot, last_message]
         )
-        message.submit(respond, inputs=[message, chatbot], outputs=[chatbot, chatbot]).then(
-            lambda: "", None, message
+        # New conversation = fresh thread_id (so the backend starts a clean
+        # checkpointer thread) + clear the visible chat history.
+        new_chat.click(
+            lambda: (str(uuid.uuid4()), [], [], ""),
+            outputs=[thread_id, chatbot, chatbot, last_message],
         )
 
     demo.queue().launch(
