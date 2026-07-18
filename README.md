@@ -50,17 +50,17 @@ classification (hotel / flight / general_qa).
 ```
 agents/
   entity.py       Shared LangGraph state (GraphState) — single source of truth
-                  passed between nodes, including the current "activity"
-                  (routing/searching/booking/clarifying/responding).
-  graph.py        LangGraph StateGraph wiring: router → {hotel_agent,
-                  flight_agent, general_qa_agent}.
-  nodes.py        Node functions. Router does intent classification only;
-                  hotel_agent_node/flight_agent_node run a real tool-calling
-                  loop against MCP tools; general_qa_node is a plain LLM.
-  mcp_client.py   The ONLY place agent code knows how to reach the MCP
-                  servers (MultiServerMCPClient config).
-  llm.py          LLM initialisation (OpenAI, override with your own).
-  prompts.py      System prompts for intent classification + each agent.
+                   passed between nodes, including the current "activity"
+                   (routing/searching/booking/clarifying/responding).
+  graph.py         LangGraph StateGraph wiring: router → {hotel_agent,
+                   flight_agent, general_qa_agent}.
+  nodes.py         Node functions. Router does intent classification only;
+                   hotel_agent_node/flight_agent_node run a real tool-calling
+                   loop against MCP tools; general_qa_node is a plain LLM.
+  mcp_client.py    The ONLY place agent code knows how to reach the MCP
+                   servers (MultiServerMCPClient config).
+  llm.py           LLM initialisation (OpenAI, override with your own).
+  prompts.py       System prompts for intent classification + each agent.
 mcp_servers/
   hotel_server.py  Standalone MCP server exposing list_hotels/search_hotels/
                    book_hotel. The only code that calls the hotel REST API.
@@ -68,10 +68,10 @@ mcp_servers/
                    book_flight. The only code that calls the flight REST API.
 main.py            FastAPI backend: /chat (blocking), /chat/stream (SSE
                    streaming with activity + token events), /hotels, /flights.
-frontend.py        Gradio chat UI: streams tokens, shows activity cues,
+frontend.py         Gradio chat UI: streams tokens, shows activity cues,
                    travel-themed responsive layout.
-app.py             Hugging Face Spaces entrypoint (delegates to frontend.py).
-render.yaml        Render Blueprint: deploys backend + both MCP servers as
+app.py              Not used in the current Render deployment (frontend.py runs directly). Kept from the original Hugging Face Spaces plan in case you deploy there later.
+render.yaml         Render Blueprint: deploys backend + both MCP servers as
                    three separate services.
 ```
 
@@ -172,36 +172,40 @@ URL to `agents/mcp_client.py`, and give a new agent node access to
 
 ## Deployment
 
-### Backend + MCP servers → Render
+All four components (backend, both MCP servers, and the Gradio frontend)
+deploy to **Render** as one Blueprint. HF Spaces was the original plan, but
+Hugging Face changed their free-tier policy: new free accounts can no longer
+create CPU Basic Gradio Spaces (only ZeroGPU, meant for GPU model inference,
+or paid Docker). Since this app is a lightweight CPU-only chat UI calling an
+external API, Render is the better fit and keeps all four services on one
+platform with one deploy flow.
 
-This repo includes `render.yaml`, a Render Blueprint that deploys three
+### All four services → Render
+
+This repo includes `render.yaml`, a Render Blueprint that deploys four
 separate services from the same repo:
 
 1. Push this repo to GitHub.
 2. In Render, choose **New → Blueprint**, point it at your repo. Render will
-   read `render.yaml` and propose all three services.
+   read `render.yaml` and propose all four services.
 3. Set the `OPENAI_API_KEY` secret on `tripweaver-backend` when prompted.
-4. Deploy. Render assigns public URLs to all three services automatically.
-5. **Important:** `render.yaml` hardcodes the expected MCP URLs
-   (`https://tripweaver-hotel-mcp.onrender.com/mcp` etc). If Render assigns
-   different service names/subdomains, update `HOTEL_MCP_URL` /
-   `FLIGHT_MCP_URL` on the backend service to match the real deployed URLs,
-   then redeploy the backend.
+4. Deploy. Render assigns public URLs to all four services automatically.
+5. **Important:** `render.yaml` hardcodes the expected URLs for the MCP
+   servers and backend (e.g. `https://tripweaver-hotel-mcp.onrender.com/mcp`).
+   If Render assigns different subdomains, update the relevant env var
+   (`HOTEL_MCP_URL` / `FLIGHT_MCP_URL` on the backend, `TRAVEL_PLANNER_API_URL`
+   on the frontend) on each affected service to match the real deployed URLs,
+   then redeploy.
 
-If you'd rather not use the Blueprint, create the three services manually as
+If you'd rather not use the Blueprint, create the four services manually as
 regular Web Services pointing at this repo, using the `startCommand` values
 from `render.yaml` for each.
 
-### Frontend → Hugging Face Spaces
-
-1. Create a new Space, SDK = Gradio.
-2. Push this repo's contents to the Space (it will use `app.py` as the
-   entrypoint automatically).
-3. In the Space's **Settings → Variables**, set:
-   ```
-   TRAVEL_PLANNER_API_URL = https://tripweaver-backend.onrender.com/chat/stream
-   ```
-4. The Space builds from `requirements.txt` and launches automatically.
+**Free-tier note:** Render's free web services spin down after 15 minutes of
+inactivity and take 30–60s to cold-start on the next request. With four
+chained free services, a fully-cold first request can feel slow. Ping all
+four (a simple `curl` to each) a few minutes before a live demo or viva so
+they're warm.
 
 ## User Guide
 

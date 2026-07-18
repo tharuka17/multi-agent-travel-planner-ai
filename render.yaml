@@ -39,3 +39,15 @@ services:
         value: 0.0.0.0
       - key: FLIGHT_API_BASE
         value: https://standing-fish-574.convex.site/flights
+
+  # Gradio chat frontend — deployed here
+
+  - type: web
+    name: tripweaver-frontend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python frontend.py
+    envVars:
+      - key: TRAVEL_PLANNER_API_URL
+        value: https://tripweaver-backend.onrender.com/chat/stream
