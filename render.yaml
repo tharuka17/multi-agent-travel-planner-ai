@@ -40,8 +40,9 @@ services:
       - key: FLIGHT_API_BASE
         value: https://standing-fish-574.convex.site/flights
 
-  # Gradio chat frontend — deployed here
-
+  # Gradio chat frontend — deployed here instead of Hugging Face Spaces,
+  # since HF now restricts free-tier accounts to ZeroGPU/paid Docker only,
+  # which doesn't fit a lightweight CPU-only chat UI.
   - type: web
     name: tripweaver-frontend
     runtime: python
@@ -50,4 +51,4 @@ services:
     startCommand: python frontend.py
     envVars:
       - key: TRAVEL_PLANNER_API_URL
-        value: https://tripweaver-backend.onrender.com/chat/stream
+        value: https://tripweaver-backend-o2rt.onrender.com/chat/stream
